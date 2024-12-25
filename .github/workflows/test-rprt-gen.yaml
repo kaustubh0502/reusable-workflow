@@ -1,0 +1,188 @@
+name: Static Website Hosting for Test Reports
+
+on:
+  workflow_call:
+
+env:
+    STORAGE_ACCOUNT_NAME: onelookapptstrprtgen
+    REPO_NAME: ${{ github.repository }}
+    BRANCH_NAME: ${{ github.head_ref }}
+    CLIENT_ID: ${{ secrets.CLIENT_ID }}
+
+jobs:
+  DynamicStorageHosting:
+    if: github.event.action != 'closed'
+    runs-on: k8s-runner-azure-non-prod #self hosted
+    permissions:
+      id-token: write
+      contents: write
+      checks: write
+      pages: write
+      pull-requests: write
+    steps:
+      
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: Install azcli
+        run: |
+         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      
+      - name: Log in to Azure #login azure subscription
+        run: | 
+         az login --identity --username ${{ secrets.CLIENT_ID }}
+
+      - name: Check the IP
+        run: |
+         echo "MY_RUNNER_IP=$(curl http://ifconfig.me)" >> $GITHUB_ENV
+
+      - name: Azure subscription show  # subscription select update
+        run: | 
+          az account show   
+          
+      - name: Check Storage Account Existence
+        id: check-storage
+        run: |
+          if az storage account show --name ${{ env.STORAGE_ACCOUNT_NAME }} --query "name" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_ENV
+          else
+            echo "exists=false" >> $GITHUB_ENV
+          fi
+ 
+      - name: Create Storage Account (if needed) #Creating a SA 123
+        if: env.exists == 'false'
+        run: |
+          az storage account create \
+            --name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --resource-group github-actions-rg \
+            --location eastus \
+            --sku Standard_LRS \
+            --allow-blob-public-access true
+          
+          az storage blob service-properties update \
+            --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --static-website \
+            --index-document index.html
+
+
+          az storage account update \
+            --name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --resource-group github-actions-rg \
+            --default-action Deny
+              
+          for ip in ${{ env.MY_RUNNER_IP}} ${{ secrets.PERIMETER_IP }}; do
+          az storage account network-rule add \
+            --resource-group github-actions-rg \
+            --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --ip-address $ip
+          done
+
+      - name: Sleep for 30 sec
+        run: sleep 30    
+      
+      - name: Sanitize Branch name
+        run: |
+          REPO_NAME_SANITIZED=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          echo "REPO_NAME_SANITIZED=$REPO_NAME_SANITIZED" >> $GITHUB_ENV
+          BRANCH_NAME_SANITIZED=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          echo "BRANCH_NAME_SANITIZED=$BRANCH_NAME_SANITIZED" >> $GITHUB_ENV
+
+      - name: Generate storage key
+        run: |
+          STORAGE_KEY=$(az storage account keys list --account-name ${{ env.STORAGE_ACCOUNT_NAME}} --query '[0].value' -o tsv)
+          echo "STORAGE_KEY=${STORAGE_KEY}" >> $GITHUB_ENV  
+          
+      - name: Update permissions for blob
+        run: |
+         az storage container set-permission \
+          --name '$web' \
+          --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+          --public-access container \
+          --account-key ${{ env.STORAGE_KEY }}  
+            
+      - name: Download Artifacts 
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report      
+        
+      - name: Sleep for 10 sec #sleep command
+        run: | 
+         sleep 10
+
+      - name: Upload to container #yes sir
+        run: | 
+          REPO_NAME_EXTRACTED=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          az storage blob upload-batch \
+            --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --source /runner/_work/${REPO_NAME_EXTRACTED}/${REPO_NAME_EXTRACTED} \
+            --destination '$web'/${{ env.REPO_NAME_SANITIZED }}/${{ env.BRANCH_NAME_SANITIZED }}/code-coverage-report \
+            --account-key ${{ env.STORAGE_KEY }} \
+            --overwrite
+
+      - name: Generate the URL
+        id: deployment
+        run: |
+          echo "url=https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net/\$web/${{ env.REPO_NAME_SANITIZED }}/${{ env.BRANCH_NAME_SANITIZED }}/code-coverage-report/index.html" >> $GITHUB_ENV      
+      
+
+      - name: Post Artifact URL in Checks Tab #updated 123
+        if: github.event_name == 'pull_request'
+        run: |
+      
+          curl -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+                  "name": "DynamicStorageHosting",
+                  "head_sha": "'"${{ github.event.pull_request.head.sha }}"'",
+                  "status": "completed",
+                  "conclusion": "success",
+                  "output": {
+                    "title": "Artifacts Uploaded for Test Reports",
+                    "summary": "Artifacts are now accessible as a static Website.",
+                    "text": "Click [here](${{ env.url }}) to view the artifacts."
+                  }
+                }' \
+            https://api.github.com/repos/${{ github.repository }}/check-runs
+        
+
+      # - name: Post Blob URL as PR Comment #updated123
+      #   if: github.event_name == 'pull_request'
+      #   run: |
+
+      #     curl -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+      #       -H "Content-Type: application/json" \
+      #       -d '{"body": "### 🎉 Artifacts Uploaded\n\nThe artifacts have been successfully uploaded to Azure Blob Storage. You can view them at:\n\n[View Artifacts](${{ env.url }})"}' \
+      #       https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+      
+
+      - name: Display Blob URL in Actions Summary
+        run: |
+          echo "Artifacts have been uploaded successfully. You can view them here"  >> $GITHUB_STEP_SUMMARY
+          echo "[View Artifacts](https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net/\$web/${{ env.REPO_NAME_SANITIZED }}/${{ env.BRANCH_NAME_SANITIZED }}/code-coverage-report/index.html)" >> $GITHUB_STEP_SUMMARY
+    
+
+  delete-artifacts:
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: k8s-runner-azure-non-prod
+    steps:
+      - name: Install azcli
+        run: |
+         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    
+      - name: Log in to Azure #login azure subscription
+        run: | 
+          az login --identity --username ${{ secrets.CLIENT_ID }}
+
+      - name: Sanitize Branch name  #updated 
+        run: |
+          REPO_NAME_SANITIZED_BEFORE_DELETE=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          echo "REPO_NAME_SANITIZED_BEFORE_DELETE=$REPO_NAME_SANITIZED_BEFORE_DELETE" >> $GITHUB_ENV
+          BRANCH_NAME_SANITIZED_BEFORE_DELETE=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          echo "BRANCH_NAME_SANITIZED_BEFORE_DELETE=$BRANCH_NAME_SANITIZED_BEFORE_DELETE" >> $GITHUB_ENV    
+
+      - name: Delete Artifacts
+        run: |
+          az storage blob delete-batch \
+            --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --source '$web' \
+            --pattern ${{ env.REPO_NAME_SANITIZED_BEFORE_DELETE }}/${{ env.BRANCH_NAME_SANITIZED_BEFORE_DELETE }}/code-coverage-report/*   
